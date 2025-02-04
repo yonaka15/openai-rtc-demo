@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import type { WorkerToMainMessage } from "../workers/types";
 
 interface Message {
   role: "assistant" | "user";
@@ -9,63 +10,78 @@ interface Message {
 }
 
 const WebRTCClient = () => {
-  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
-  const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const workerRef = useRef<Worker>(null);
+  const peerConnection = useRef<RTCPeerConnection | null>(null);
+  const dataChannel = useRef<RTCDataChannel | null>(null);
+
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputMessage, setInputMessage] = useState("");
   const [status, setStatus] = useState("Initializing...");
   const [error, setError] = useState<string | null>(null);
   const [isDataChannelReady, setIsDataChannelReady] = useState(false);
   const [debugLog, setDebugLog] = useState<string[]>([]);
+  const [transcripts, setTranscripts] = useState<string[]>([]);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const debugLogEndRef = useRef<HTMLDivElement>(null);
+  const transcriptEndRef = useRef<HTMLDivElement>(null);
 
   const scrollToBottom = () => {
+    // For chat messages
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  const scrollDebugToBottom = () => {
+    const debugLogContainer = debugLogEndRef.current?.parentElement;
+    if (debugLogContainer) {
+      debugLogContainer.scrollTop = debugLogContainer.scrollHeight;
+    }
+  };
+
+  const scrollTranscriptToBottom = () => {
+    const transcriptContainer = transcriptEndRef.current?.parentElement;
+    if (transcriptContainer) {
+      transcriptContainer.scrollTop = transcriptContainer.scrollHeight;
+    }
   };
 
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
 
-  // Debug logging helper
+  useEffect(() => {
+    scrollDebugToBottom();
+  }, [debugLog]);
+
+  useEffect(() => {
+    scrollTranscriptToBottom();
+  }, [transcripts]);
+
+  // Add debug log with auto scroll
   const addDebugLog = (message: string) => {
-    console.log(message); // Also log to console
+    console.log(message);
     setDebugLog((prev) => [...prev, `${new Date().toISOString()}: ${message}`]);
   };
 
-  useEffect(() => {
-    initializeWebRTC();
-    return () => {
-      // Cleanup on unmount
-      if (peerConnectionRef.current) {
-        peerConnectionRef.current.close();
-      }
-      if (dataChannelRef.current) {
-        dataChannelRef.current.close();
-      }
-    };
-  }, []);
+  // Add transcript handling function
+  const addTranscript = (text: string) => {
+    setTranscripts((prev) => [...prev, text]);
+  };
 
-  const initializeWebRTC = async () => {
+  const initializeWebRTC = async (token: string) => {
     try {
-      // Get session token
-      setStatus("Getting session token...");
-      addDebugLog("Requesting session token...");
-      const tokenResponse = await fetch("/api/session");
-      const data = await tokenResponse.json();
-
-      if (!data.client_secret?.value) {
-        throw new Error("Failed to get valid session token");
-      }
-
-      addDebugLog("Received session token");
-      const EPHEMERAL_KEY = data.client_secret.value;
-      setStatus("Creating peer connection...");
-
       // Create peer connection
       const pc = new RTCPeerConnection();
-      peerConnectionRef.current = pc;
+      peerConnection.current = pc;
       addDebugLog("Peer connection created");
+
+      // Add local audio track
+      addDebugLog("Getting microphone access...");
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach((track) => {
+        pc.addTrack(track, stream);
+      });
+      addDebugLog("Added local audio track");
 
       // Connection state monitoring
       pc.onconnectionstatechange = () => {
@@ -86,57 +102,50 @@ const WebRTCClient = () => {
         addDebugLog(`ICE candidate: ${event.candidate ? "received" : "null"}`);
       };
 
-      // Set up audio element
-      const audioEl = document.createElement("audio");
-      audioEl.autoplay = true;
-
-      pc.ontrack = (e) => {
-        audioEl.srcObject = e.streams[0];
+      // Handle remote media stream
+      pc.ontrack = (event) => {
         addDebugLog("Received remote audio track");
-        setStatus("Received remote audio track");
+        const audioElement = new Audio();
+        audioElement.srcObject = event.streams[0];
+        audioElement.play().catch((error) => {
+          addDebugLog(`Error playing audio: ${error}`);
+        });
       };
 
-      // Add local audio track
-      setStatus("Getting microphone access...");
-      addDebugLog("Requesting microphone access...");
-      const ms = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-      });
-      pc.addTrack(ms.getTracks()[0]);
-      addDebugLog("Local audio track added");
-
       // Set up data channel
-      setStatus("Setting up data channel...");
-      addDebugLog("Creating data channel...");
       const dc = pc.createDataChannel("oai-events");
-      dataChannelRef.current = dc;
+      dataChannel.current = dc;
+      addDebugLog("Data channel created");
 
       // Add data channel event listeners
       dc.onopen = () => {
         addDebugLog("Data channel opened");
         setIsDataChannelReady(true);
-        setStatus("Data channel opened");
+        setStatus("Ready");
       };
 
       dc.onclose = () => {
         addDebugLog("Data channel closed");
         setIsDataChannelReady(false);
-        setStatus("Data channel closed");
       };
 
       dc.onerror = (error) => {
-        addDebugLog(`Data channel error: ${error.toString()}`);
-        setError("Data channel error occurred");
+        const errorMsg = `Data channel error: ${error.toString()}`;
+        addDebugLog(errorMsg);
+        setError(errorMsg);
       };
 
-      dc.addEventListener("message", (e) => {
+      dc.onmessage = (event) => {
         try {
-          const realtimeEvent = JSON.parse(e.data);
+          const realtimeEvent = JSON.parse(event.data);
           addDebugLog(`Received event: ${JSON.stringify(realtimeEvent)}`);
 
           // Handle text delta events
-          if (realtimeEvent.type === "response.text.delta") {
-            setMessages((prev) => {
+          if (
+            realtimeEvent.type === "response.text.delta" &&
+            typeof realtimeEvent.delta === "string"
+          ) {
+            setMessages((prev: Message[]) => {
               const lastMessage = prev[prev.length - 1];
               if (lastMessage?.role === "assistant") {
                 return [
@@ -144,8 +153,9 @@ const WebRTCClient = () => {
                   {
                     ...lastMessage,
                     content: lastMessage.content + realtimeEvent.delta,
+                    timestamp: lastMessage.timestamp,
                   },
-                ];
+                ] as Message[];
               } else {
                 return [
                   ...prev,
@@ -154,94 +164,158 @@ const WebRTCClient = () => {
                     content: realtimeEvent.delta,
                     timestamp: new Date(),
                   },
-                ];
+                ] as Message[];
               }
             });
+          }
+          // Handle audio transcript events
+          else if (
+            realtimeEvent.type === "response.audio_transcript.done" &&
+            typeof realtimeEvent.transcript === "string"
+          ) {
+            addTranscript(realtimeEvent.transcript);
           }
         } catch (error) {
           addDebugLog(`Error parsing event: ${error}`);
         }
-      });
+      };
 
       // Create and set local description
-      setStatus("Creating offer...");
       addDebugLog("Creating offer...");
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       addDebugLog("Local description set");
 
-      // Get remote description
-      setStatus("Getting remote description...");
-      addDebugLog("Sending offer to OpenAI...");
-      const baseUrl = "https://api.openai.com/v1/realtime";
-      const model = "gpt-4o-realtime-preview-2024-12-17";
-      const sdpResponse = await fetch(`${baseUrl}?model=${model}`, {
-        method: "POST",
-        body: offer.sdp,
-        headers: {
-          Authorization: `Bearer ${EPHEMERAL_KEY}`,
-          "Content-Type": "application/sdp",
-        },
-      });
-
-      if (!sdpResponse.ok) {
-        throw new Error(
-          `Failed to get remote description: ${sdpResponse.status}`
-        );
+      // Get remote description through worker
+      if (workerRef.current) {
+        workerRef.current.postMessage({
+          type: "GET_REMOTE_DESCRIPTION",
+          data: {
+            content: offer.sdp,
+            token,
+          },
+        });
       }
-
-      addDebugLog("Received answer from OpenAI");
-      const answer: RTCSessionDescriptionInit = {
-        type: "answer",
-        sdp: await sdpResponse.text(),
-      };
-
-      // Set remote description
-      await pc.setRemoteDescription(answer);
-      addDebugLog("Remote description set");
-      setStatus("Connection established");
-    } catch (err) {
+    } catch (error) {
       const errorMessage =
-        err instanceof Error ? err.message : "Failed to initialize WebRTC";
+        error instanceof Error ? error.message : "Failed to initialize WebRTC";
       addDebugLog(`Error: ${errorMessage}`);
-      console.error("WebRTC initialization failed:", err);
       setError(errorMessage);
-      setStatus("Failed");
+      setStatus("Error");
     }
   };
+
+  useEffect(() => {
+    // Initialize worker
+    workerRef.current = new Worker(
+      new URL("../workers/webrtc.worker.ts", import.meta.url)
+    );
+
+    // Handle messages from worker
+    workerRef.current.onmessage = async (
+      event: MessageEvent<WorkerToMainMessage>
+    ) => {
+      const { type, data, error: workerError } = event.data;
+
+      switch (type) {
+        case "TOKEN_RECEIVED":
+          if (data?.token) {
+            await initializeWebRTC(data.token);
+          }
+          break;
+
+        case "REMOTE_DESCRIPTION_RECEIVED":
+          if (data?.sdp && peerConnection.current) {
+            try {
+              const answer: RTCSessionDescriptionInit = {
+                type: "answer",
+                sdp: data.sdp,
+              };
+              await peerConnection.current.setRemoteDescription(answer);
+              addDebugLog("Remote description set");
+              setStatus("Connecting...");
+            } catch (error) {
+              const errorMsg =
+                error instanceof Error
+                  ? error.message
+                  : "Failed to set remote description";
+              addDebugLog(`Error: ${errorMsg}`);
+              setError(errorMsg);
+            }
+          }
+          break;
+
+        case "MESSAGE_FORMATTED":
+          if (
+            data?.userMessage &&
+            data?.responseRequest &&
+            dataChannel.current?.readyState === "open"
+          ) {
+            try {
+              addDebugLog(
+                `Sending message: ${JSON.stringify(data.userMessage)}`
+              );
+              dataChannel.current.send(JSON.stringify(data.userMessage));
+
+              // Wait a bit for the message to be processed
+              await new Promise((resolve) => setTimeout(resolve, 100));
+
+              addDebugLog(
+                `Requesting response: ${JSON.stringify(data.responseRequest)}`
+              );
+              dataChannel.current.send(JSON.stringify(data.responseRequest));
+              addDebugLog("Message and response request sent successfully");
+            } catch (error) {
+              const errorMsg =
+                error instanceof Error
+                  ? error.message
+                  : "Failed to send message";
+              addDebugLog(`Error sending message: ${errorMsg}`);
+              setError(errorMsg);
+            }
+          }
+          break;
+
+        case "ERROR":
+          setError(workerError || "Unknown error occurred");
+          setStatus("Error");
+          break;
+
+        case "DEBUG_LOG":
+          if (typeof data === "string") {
+            addDebugLog(data);
+          }
+          break;
+      }
+    };
+
+    // Initialize connection
+    workerRef.current.postMessage({ type: "INIT_CONNECTION" });
+
+    // Cleanup
+    return () => {
+      if (dataChannel.current) {
+        dataChannel.current.close();
+      }
+      if (peerConnection.current) {
+        peerConnection.current.close();
+      }
+      if (workerRef.current) {
+        workerRef.current.terminate();
+      }
+    };
+  }, []);
 
   const sendMessage = async () => {
     if (!inputMessage.trim()) return;
 
-    if (
-      !dataChannelRef.current ||
-      dataChannelRef.current.readyState !== "open"
-    ) {
-      const stateMessage = `Data channel not ready. Current state: ${dataChannelRef.current?.readyState}`;
-      addDebugLog(stateMessage);
-      console.error(stateMessage);
+    if (!isDataChannelReady) {
+      console.error("Data channel not ready");
       return;
     }
 
-    // Send user message
-    const userMessage = {
-      type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text: inputMessage,
-          },
-        ],
-      },
-    };
-
     try {
-      // Send user message
-      addDebugLog(`Sending message: ${JSON.stringify(userMessage)}`);
-      dataChannelRef.current.send(JSON.stringify(userMessage));
+      // Add user message to UI immediately
       setMessages((prev) => [
         ...prev,
         {
@@ -251,112 +325,133 @@ const WebRTCClient = () => {
         },
       ]);
 
-      // Wait a bit for the message to be processed
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      // Request response from the model
-      const responseRequest = {
-        type: "response.create",
-        response: {
-          modalities: ["text"],
+      // Format message through worker
+      workerRef.current?.postMessage({
+        type: "FORMAT_MESSAGE",
+        data: {
+          content: inputMessage,
         },
-      };
-
-      addDebugLog(`Requesting response: ${JSON.stringify(responseRequest)}`);
-      dataChannelRef.current.send(JSON.stringify(responseRequest));
+      });
 
       setInputMessage("");
-      addDebugLog("Message and response request sent successfully");
-    } catch (error) {
+    } catch (err) {
       const errorMessage =
-        error instanceof Error ? error.message : "Failed to send message";
-      addDebugLog(`Error sending message: ${errorMessage}`);
-      console.error("Failed to send message:", error);
+        err instanceof Error ? err.message : "Failed to send message";
+      console.error("Failed to send message:", err);
       setError(errorMessage);
     }
   };
 
   return (
-    <div className="p-4 max-w-4xl mx-auto">
-      <div className="mb-4">
-        <h2 className="text-xl font-semibold mb-2">WebRTC Status</h2>
-        <p
-          className={`${
-            status === "Failed" ? "text-red-500" : "text-blue-500"
-          }`}
-        >
-          {status}
-        </p>
-        <p
-          className={`${
-            isDataChannelReady ? "text-green-500" : "text-yellow-500"
-          }`}
-        >
-          Data Channel: {isDataChannelReady ? "Ready" : "Not Ready"}
-        </p>
-      </div>
-
-      {error && (
-        <div className="bg-red-50 border border-red-200 rounded-md p-4 mb-4">
-          <p className="text-red-600">{error}</p>
-        </div>
-      )}
-
-      {/* Chat Messages */}
-      <div className="border rounded-lg mb-4 h-96 overflow-y-auto p-4 bg-gray-50">
-        {messages.map((msg, index) => (
-          <div
-            key={index}
-            className={`mb-4 ${
-              msg.role === "user" ? "text-right" : "text-left"
+    <div className="flex flex-col h-screen">
+      <div className="p-4 flex-grow overflow-hidden max-w-4xl mx-auto w-full flex flex-col">
+        {/* Status Section */}
+        <div className="mb-4 flex-none">
+          <h2 className="text-xl font-semibold mb-2">WebRTC Status</h2>
+          <p
+            className={`${
+              status === "Error" ? "text-red-500" : "text-blue-500"
             }`}
           >
-            <div
-              className={`inline-block max-w-[70%] rounded-lg px-4 py-2 ${
-                msg.role === "user"
-                  ? "bg-blue-500 text-white"
-                  : "bg-white border"
-              }`}
-            >
-              <p>{msg.content}</p>
-              <p className="text-xs mt-1 opacity-50">
-                {msg.timestamp.toLocaleTimeString()}
-              </p>
+            {status}
+          </p>
+          <p
+            className={`${
+              isDataChannelReady ? "text-green-500" : "text-yellow-500"
+            }`}
+          >
+            Data Channel: {isDataChannelReady ? "Ready" : "Not Ready"}
+          </p>
+        </div>
+
+        {error && (
+          <div className="bg-red-50 border border-red-200 rounded-md p-4 mb-4 flex-none">
+            <p className="text-red-600">{error}</p>
+          </div>
+        )}
+
+        {/* Main Content Area - using CSS Grid */}
+        <div className="flex-grow grid grid-cols-1 md:grid-cols-2 gap-4 min-h-0">
+          {/* Left Side: Chat Messages */}
+          <div className="flex flex-col min-h-0">
+            <h2 className="text-xl font-semibold mb-2 flex-none">
+              Chat Messages
+            </h2>
+            <div className="border rounded-lg p-4 bg-gray-50 flex-grow overflow-y-auto">
+              {messages.map((msg, index) => (
+                <div
+                  key={index}
+                  className={`mb-4 ${
+                    msg.role === "user" ? "text-right" : "text-left"
+                  }`}
+                >
+                  <div
+                    className={`inline-block max-w-[70%] rounded-lg px-4 py-2 ${
+                      msg.role === "user"
+                        ? "bg-blue-500 text-white"
+                        : "bg-white border"
+                    }`}
+                  >
+                    <p>{msg.content}</p>
+                    <p className="text-xs mt-1 opacity-50">
+                      {msg.timestamp.toLocaleTimeString()}
+                    </p>
+                  </div>
+                </div>
+              ))}
+              <div ref={messagesEndRef} />
             </div>
           </div>
-        ))}
-        <div ref={messagesEndRef} />
-      </div>
 
-      {/* Message Input */}
-      <div className="flex gap-2">
-        <input
-          type="text"
-          value={inputMessage}
-          onChange={(e) => setInputMessage(e.target.value)}
-          onKeyPress={(e) => e.key === "Enter" && sendMessage()}
-          placeholder="Type a message..."
-          className="flex-1 border rounded-md px-4 py-2"
-          disabled={!isDataChannelReady}
-        />
-        <button
-          onClick={sendMessage}
-          disabled={!isDataChannelReady || !inputMessage.trim()}
-          className="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-md disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          Send
-        </button>
-      </div>
+          {/* Right Side: Voice Transcripts */}
+          <div className="flex flex-col min-h-0">
+            <h2 className="text-xl font-semibold mb-2 flex-none">
+              Voice Transcripts
+            </h2>
+            <div className="border rounded-lg p-4 bg-purple-50 flex-grow overflow-y-auto">
+              {transcripts.map((transcript, index) => (
+                <div key={index} className="mb-2 last:mb-0">
+                  <p className="text-purple-800">{transcript}</p>
+                </div>
+              ))}
+              <div ref={transcriptEndRef} />
+            </div>
+          </div>
+        </div>
 
-      {/* Debug Log */}
-      <div className="mt-4">
-        <h3 className="text-lg font-semibold mb-2">Debug Log</h3>
-        <div className="bg-gray-100 p-4 rounded-md max-h-48 overflow-y-auto">
-          {debugLog.map((log, index) => (
-            <p key={index} className="text-sm font-mono mb-1">
-              {log}
-            </p>
-          ))}
+        {/* Input Section */}
+        <div className="mt-4 flex-none">
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={inputMessage}
+              onChange={(e) => setInputMessage(e.target.value)}
+              onKeyPress={(e) => e.key === "Enter" && sendMessage()}
+              placeholder="Type a message..."
+              className="flex-1 border rounded-md px-4 py-2"
+              disabled={!isDataChannelReady}
+            />
+            <button
+              onClick={sendMessage}
+              disabled={!isDataChannelReady || !inputMessage.trim()}
+              className="bg-blue-500 hover:bg-blue-600 text-white px-4 py-2 rounded-md disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              Send
+            </button>
+          </div>
+        </div>
+
+        {/* Debug Log */}
+        <div className="mt-4 flex-none">
+          <h3 className="text-lg font-semibold mb-2">Debug Log</h3>
+          <div className="bg-gray-100 p-4 rounded-md h-32 overflow-y-auto">
+            {debugLog.map((log, index) => (
+              <p key={index} className="text-sm font-mono mb-1">
+                {log}
+              </p>
+            ))}
+            <div ref={debugLogEndRef} />
+          </div>
         </div>
       </div>
     </div>
