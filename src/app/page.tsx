@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { WorkerToMainMessage } from "../workers/types";
 
 interface Message {
@@ -10,17 +10,19 @@ interface Message {
 }
 
 const WebRTCClient = () => {
-  const workerRef = useRef<Worker>(null);
+  const workerRef = useRef<Worker | null>(null);
   const peerConnection = useRef<RTCPeerConnection | null>(null);
   const dataChannel = useRef<RTCDataChannel | null>(null);
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputMessage, setInputMessage] = useState("");
-  const [status, setStatus] = useState("Initializing...");
+  const [status, setStatus] = useState("Disconnected");
   const [error, setError] = useState<string | null>(null);
   const [isDataChannelReady, setIsDataChannelReady] = useState(false);
   const [debugLog, setDebugLog] = useState<string[]>([]);
   const [transcripts, setTranscripts] = useState<string[]>([]);
+  const [isConnected, setIsConnected] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const debugLogEndRef = useRef<HTMLDivElement>(null);
@@ -122,6 +124,7 @@ const WebRTCClient = () => {
         addDebugLog("Data channel opened");
         setIsDataChannelReady(true);
         setStatus("Ready");
+        setIsConnecting(false);
       };
 
       dc.onclose = () => {
@@ -202,109 +205,168 @@ const WebRTCClient = () => {
       addDebugLog(`Error: ${errorMessage}`);
       setError(errorMessage);
       setStatus("Error");
+      setIsConnecting(false);
+      setIsConnected(false);
     }
   };
 
-  useEffect(() => {
-    // Initialize worker
-    workerRef.current = new Worker(
-      new URL("../workers/webrtc.worker.ts", import.meta.url)
-    );
+  // Initialize connection function
+  const initializeConnection = useCallback(async () => {
+    setIsConnecting(true);
+    setStatus("Initializing...");
+    setError(null);
+    
+    try {
+      // Worker の初期化
+      if (!workerRef.current) {
+        workerRef.current = new Worker(
+          new URL("../workers/webrtc.worker.ts", import.meta.url)
+        );
+        
+        // Worker からのメッセージハンドラを設定
+        workerRef.current.onmessage = async (
+          event: MessageEvent<WorkerToMainMessage>
+        ) => {
+          const { type, data, error: workerError } = event.data;
 
-    // Handle messages from worker
-    workerRef.current.onmessage = async (
-      event: MessageEvent<WorkerToMainMessage>
-    ) => {
-      const { type, data, error: workerError } = event.data;
+          switch (type) {
+            case "TOKEN_RECEIVED":
+              if (data?.token) {
+                await initializeWebRTC(data.token);
+              }
+              break;
 
-      switch (type) {
-        case "TOKEN_RECEIVED":
-          if (data?.token) {
-            await initializeWebRTC(data.token);
+            case "REMOTE_DESCRIPTION_RECEIVED":
+              if (data?.sdp && peerConnection.current) {
+                try {
+                  const answer: RTCSessionDescriptionInit = {
+                    type: "answer",
+                    sdp: data.sdp,
+                  };
+                  await peerConnection.current.setRemoteDescription(answer);
+                  addDebugLog("Remote description set");
+                  setStatus("Connecting...");
+                } catch (error) {
+                  const errorMsg =
+                    error instanceof Error
+                      ? error.message
+                      : "Failed to set remote description";
+                  addDebugLog(`Error: ${errorMsg}`);
+                  setError(errorMsg);
+                  setIsConnecting(false);
+                }
+              }
+              break;
+
+            case "MESSAGE_FORMATTED":
+              if (
+                data?.userMessage &&
+                data?.responseRequest &&
+                dataChannel.current?.readyState === "open"
+              ) {
+                try {
+                  addDebugLog(
+                    `Sending message: ${JSON.stringify(data.userMessage)}`
+                  );
+                  dataChannel.current.send(JSON.stringify(data.userMessage));
+
+                  // Wait a bit for the message to be processed
+                  await new Promise((resolve) => setTimeout(resolve, 100));
+
+                  addDebugLog(
+                    `Requesting response: ${JSON.stringify(data.responseRequest)}`
+                  );
+                  dataChannel.current.send(JSON.stringify(data.responseRequest));
+                  addDebugLog("Message and response request sent successfully");
+                } catch (error) {
+                  const errorMsg =
+                    error instanceof Error
+                      ? error.message
+                      : "Failed to send message";
+                  addDebugLog(`Error sending message: ${errorMsg}`);
+                  setError(errorMsg);
+                }
+              }
+              break;
+
+            case "ERROR":
+              setError(workerError || "Unknown error occurred");
+              setStatus("Error");
+              setIsConnecting(false);
+              setIsConnected(false);
+              break;
+
+            case "DEBUG_LOG":
+              if (typeof data === "string") {
+                addDebugLog(data);
+              }
+              break;
           }
-          break;
-
-        case "REMOTE_DESCRIPTION_RECEIVED":
-          if (data?.sdp && peerConnection.current) {
-            try {
-              const answer: RTCSessionDescriptionInit = {
-                type: "answer",
-                sdp: data.sdp,
-              };
-              await peerConnection.current.setRemoteDescription(answer);
-              addDebugLog("Remote description set");
-              setStatus("Connecting...");
-            } catch (error) {
-              const errorMsg =
-                error instanceof Error
-                  ? error.message
-                  : "Failed to set remote description";
-              addDebugLog(`Error: ${errorMsg}`);
-              setError(errorMsg);
-            }
-          }
-          break;
-
-        case "MESSAGE_FORMATTED":
-          if (
-            data?.userMessage &&
-            data?.responseRequest &&
-            dataChannel.current?.readyState === "open"
-          ) {
-            try {
-              addDebugLog(
-                `Sending message: ${JSON.stringify(data.userMessage)}`
-              );
-              dataChannel.current.send(JSON.stringify(data.userMessage));
-
-              // Wait a bit for the message to be processed
-              await new Promise((resolve) => setTimeout(resolve, 100));
-
-              addDebugLog(
-                `Requesting response: ${JSON.stringify(data.responseRequest)}`
-              );
-              dataChannel.current.send(JSON.stringify(data.responseRequest));
-              addDebugLog("Message and response request sent successfully");
-            } catch (error) {
-              const errorMsg =
-                error instanceof Error
-                  ? error.message
-                  : "Failed to send message";
-              addDebugLog(`Error sending message: ${errorMsg}`);
-              setError(errorMsg);
-            }
-          }
-          break;
-
-        case "ERROR":
-          setError(workerError || "Unknown error occurred");
-          setStatus("Error");
-          break;
-
-        case "DEBUG_LOG":
-          if (typeof data === "string") {
-            addDebugLog(data);
-          }
-          break;
+        };
       }
-    };
+      
+      // 接続の初期化
+      workerRef.current.postMessage({ type: "INIT_CONNECTION" });
+      setIsConnected(true);
+    } catch (error) {
+      const errorMessage = error instanceof Error 
+        ? error.message 
+        : "Failed to initialize connection";
+      setError(errorMessage);
+      setStatus("Error");
+      setIsConnecting(false);
+      setIsConnected(false);
+    }
+  }, []);
 
-    // Initialize connection
-    workerRef.current.postMessage({ type: "INIT_CONNECTION" });
-
-    // Cleanup
-    return () => {
+  // Disconnect function
+  const disconnectConnection = useCallback(() => {
+    setIsConnecting(true);
+    
+    try {
+      // データチャネルのクローズ
       if (dataChannel.current) {
         dataChannel.current.close();
+        dataChannel.current = null;
       }
+      
+      // ピア接続のクローズ
       if (peerConnection.current) {
         peerConnection.current.close();
+        peerConnection.current = null;
       }
+      
+      // Worker の終了
       if (workerRef.current) {
         workerRef.current.terminate();
+        workerRef.current = null;
+      }
+      
+      // 状態の更新
+      setIsDataChannelReady(false);
+      setStatus("Disconnected");
+      setIsConnected(false);
+      addDebugLog("Connection terminated");
+    } catch (error) {
+      const errorMessage = error instanceof Error 
+        ? error.message 
+        : "Failed to disconnect properly";
+      setError(errorMessage);
+      addDebugLog(`Error during disconnection: ${errorMessage}`);
+    } finally {
+      setIsConnecting(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    // クリーンアップ関数のみを返す（自動接続は行わない）
+    return () => {
+      // コンポーネントのアンマウント時に接続をクリーンアップ
+      if (isConnected) {
+        disconnectConnection();
       }
     };
-  }, []);
+  }, [disconnectConnection, isConnected]);
 
   const sendMessage = async () => {
     if (!inputMessage.trim()) return;
@@ -347,10 +409,30 @@ const WebRTCClient = () => {
       <div className="p-4 flex-grow overflow-hidden max-w-4xl mx-auto w-full flex flex-col">
         {/* Status Section */}
         <div className="mb-4 flex-none">
-          <h2 className="text-xl font-semibold mb-2">WebRTC Status</h2>
+          <div className="flex items-center justify-between">
+            <h2 className="text-xl font-semibold">WebRTC Status</h2>
+            <div className="flex gap-2">
+              <button
+                onClick={initializeConnection}
+                disabled={isConnected || isConnecting}
+                className="bg-green-500 hover:bg-green-600 text-white px-4 py-2 rounded-md disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isConnecting ? "Connecting..." : "Connect"}
+              </button>
+              <button
+                onClick={disconnectConnection}
+                disabled={!isConnected || isConnecting}
+                className="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-md disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Disconnect
+              </button>
+            </div>
+          </div>
           <p
             className={`${
-              status === "Error" ? "text-red-500" : "text-blue-500"
+              status === "Error" ? "text-red-500" : 
+              status === "Disconnected" ? "text-gray-500" :
+              "text-blue-500"
             }`}
           >
             {status}
