@@ -6,6 +6,9 @@ export type WorkerMessageType =
   | "REMOTE_DESCRIPTION_RECEIVED"
   | "FORMAT_MESSAGE"
   | "MESSAGE_FORMATTED"
+  | "FUNCTION_CALL"        // 追加: function callを処理
+  | "FUNCTION_RESULT"      // 追加: function resultを処理
+  | "SEND_TO_DATA_CHANNEL" // 追加: データチャネルにメッセージを送信
   | "ERROR"
   | "DEBUG_LOG";
 
@@ -23,6 +26,7 @@ export interface MainToWorkerMessage {
     content?: string;
     token?: string;
     timestamp?: Date;
+    functionResult?: any;  // 追加: 関数実行結果
   };
 }
 
@@ -35,6 +39,8 @@ export interface WorkerToMainMessage {
     content?: string;
     userMessage?: any;
     responseRequest?: any;
+    functionCall?: any;    // 追加: function callデータ
+    message?: any;         // 追加: データチャネルに送信するメッセージ
     timestamp?: Date;
   };
   error?: string;

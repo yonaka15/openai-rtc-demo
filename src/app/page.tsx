@@ -9,6 +9,98 @@ interface Message {
   timestamp: Date;
 }
 
+// Function Callingの型定義
+interface FunctionCall {
+  id: string;
+  name: string;
+  arguments: Record<string, any>;
+}
+
+interface FunctionResult {
+  id: string;
+  name: string;
+  result: any;
+  error?: string;
+}
+
+// 簡易的なFunction Status表示コンポーネント
+const FunctionStatus = ({ 
+  activeFunctions, 
+  completedFunctions 
+}: { 
+  activeFunctions: Map<string, { call: FunctionCall; startTime: Date }>;
+  completedFunctions: FunctionResult[];
+}) => {
+  // 表示件数を制限（最新の3件）
+  const recentCompletedFunctions = completedFunctions.slice(-3).reverse();
+  
+  if (activeFunctions.size === 0 && recentCompletedFunctions.length === 0) {
+    return null;
+  }
+  
+  return (
+    <div className="space-y-3">
+      <h3 className="text-lg font-semibold">Function Calls</h3>
+      
+      {/* 現在実行中の関数 */}
+      {activeFunctions.size > 0 && (
+        <div className="space-y-2">
+          <h4 className="font-medium">Active:</h4>
+          {Array.from(activeFunctions.entries()).map(([id, { call, startTime }]) => {
+            const elapsedSeconds = Math.round((new Date().getTime() - startTime.getTime()) / 1000);
+            
+            return (
+              <div key={id} className="text-sm p-2 bg-blue-50 border border-blue-200 rounded-md">
+                <div className="flex items-center">
+                  <div className="animate-pulse w-2 h-2 bg-blue-500 rounded-full mr-2"></div>
+                  <div className="font-medium">{call.name}</div>
+                  <div className="ml-auto text-xs text-gray-500">
+                    {elapsedSeconds}s
+                  </div>
+                </div>
+                <div className="text-xs mt-1 text-gray-700">
+                  引数: {JSON.stringify(call.arguments)}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      
+      {/* 完了した関数の結果 */}
+      {recentCompletedFunctions.length > 0 && (
+        <div className="space-y-2">
+          <h4 className="font-medium">Recent:</h4>
+          {recentCompletedFunctions.map((result, index) => (
+            <div 
+              key={index}
+              className={`text-sm p-2 rounded-md ${
+                result.error 
+                  ? 'bg-red-50 border border-red-200' 
+                  : 'bg-green-50 border border-green-200'
+              }`}
+            >
+              <div className="font-medium">
+                {result.name} 
+                {result.error ? ' (Error)' : ' (Success)'}
+              </div>
+              <div className="mt-1">
+                {result.error ? (
+                  <span className="text-red-600">{result.error}</span>
+                ) : (
+                  <pre className="text-xs overflow-x-auto bg-white p-1 rounded border">
+                    {JSON.stringify(result.result, null, 2)}
+                  </pre>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
 const WebRTCClient = () => {
   const workerRef = useRef<Worker>(null);
   const peerConnection = useRef<RTCPeerConnection | null>(null);
@@ -21,6 +113,10 @@ const WebRTCClient = () => {
   const [isDataChannelReady, setIsDataChannelReady] = useState(false);
   const [debugLog, setDebugLog] = useState<string[]>([]);
   const [transcripts, setTranscripts] = useState<string[]>([]);
+  
+  // Function Calling用の状態
+  const [activeFunctions, setActiveFunctions] = useState<Map<string, { call: FunctionCall; startTime: Date }>>(new Map());
+  const [completedFunctions, setCompletedFunctions] = useState<FunctionResult[]>([]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const debugLogEndRef = useRef<HTMLDivElement>(null);
@@ -122,6 +218,45 @@ const WebRTCClient = () => {
         addDebugLog("Data channel opened");
         setIsDataChannelReady(true);
         setStatus("Ready");
+        
+        // データチャネルが開いたら、function callingを有効にするためにセッションを更新
+        if (dc.readyState === "open") {
+          try {
+            // Function Call用のセッション更新イベント (修正済み)
+            const sessionUpdateEvent = {
+              type: "session.update",
+              session: {
+                tools: [
+                  {
+                    type: "function",
+                    name: "get_weather",
+                    description: "指定した場所の現在の天気情報を取得します。",
+                    parameters: {
+                      type: "object",
+                      properties: {
+                        location: {
+                          type: "string",
+                          description: "都市名や住所など、天気を知りたい場所",
+                        },
+                        units: {
+                          type: "string",
+                          enum: ["celsius", "fahrenheit"],
+                          description: "温度の単位",
+                        },
+                      },
+                      required: ["location"],
+                    },
+                  }
+                ]
+              }
+            };
+            
+            addDebugLog("Sending session update with function definitions");
+            dc.send(JSON.stringify(sessionUpdateEvent));
+          } catch (error) {
+            addDebugLog(`Error sending session update: ${error}`);
+          }
+        }
       };
 
       dc.onclose = () => {
@@ -139,6 +274,63 @@ const WebRTCClient = () => {
         try {
           const realtimeEvent = JSON.parse(event.data);
           addDebugLog(`Received event: ${JSON.stringify(realtimeEvent)}`);
+
+          // Function callイベントの処理
+          if (realtimeEvent.type === "response.function.call") {
+            addDebugLog(`Function call received: ${JSON.stringify(realtimeEvent)}`);
+            
+            try {
+              const functionCall = {
+                id: realtimeEvent.id,
+                name: realtimeEvent.function.name,
+                arguments: JSON.parse(realtimeEvent.function.arguments)
+              };
+              
+              // アクティブ関数リストに追加
+              setActiveFunctions(prev => {
+                const newMap = new Map(prev);
+                newMap.set(functionCall.id, {
+                  call: functionCall,
+                  startTime: new Date()
+                });
+                return newMap;
+              });
+              
+              // 関数の実行（ここでは天気関数のモック実装のみ）
+              executeFunction(functionCall).then(result => {
+                // 完了した関数リストに追加
+                setCompletedFunctions(prev => [...prev, result]);
+                
+                // アクティブリストから削除
+                setActiveFunctions(prev => {
+                  const newMap = new Map(prev);
+                  newMap.delete(functionCall.id);
+                  return newMap;
+                });
+                
+                // 結果をOpenAIに返信
+                if (dataChannel.current?.readyState === "open") {
+                  const functionResponseEvent = {
+                    type: "response.function.response",
+                    function: {
+                      name: result.name,
+                      response: result.error ? { error: result.error } : result.result
+                    },
+                    id: result.id
+                  };
+                  
+                  addDebugLog(`Sending function response: ${JSON.stringify(functionResponseEvent)}`);
+                  dataChannel.current.send(JSON.stringify(functionResponseEvent));
+                }
+              }).catch(error => {
+                addDebugLog(`Error executing function: ${error}`);
+              });
+            } catch (error) {
+              addDebugLog(`Error processing function call: ${error}`);
+            }
+            
+            return;
+          }
 
           // Handle text delta events
           if (
@@ -177,6 +369,38 @@ const WebRTCClient = () => {
           }
         } catch (error) {
           addDebugLog(`Error parsing event: ${error}`);
+        }
+      };
+      
+      // 関数実行処理
+      const executeFunction = async (functionCall: FunctionCall): Promise<FunctionResult> => {
+        addDebugLog(`Executing function: ${functionCall.name}`);
+        
+        // 擬似的な遅延を追加
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        if (functionCall.name === 'get_weather') {
+          const { location, units = 'celsius' } = functionCall.arguments;
+          return {
+            id: functionCall.id,
+            name: functionCall.name,
+            result: {
+              location,
+              temperature: units === 'celsius' ? Math.floor(Math.random() * 15) + 15 : Math.floor(Math.random() * 30) + 60,
+              condition: ['晴れ', '曇り', '雨', '雪', '霧'][Math.floor(Math.random() * 5)],
+              humidity: Math.floor(Math.random() * 50) + 30,
+              windSpeed: Math.floor(Math.random() * 20) + 5,
+              units,
+              timestamp: new Date().toISOString()
+            }
+          };
+        } else {
+          return {
+            id: functionCall.id,
+            name: functionCall.name,
+            result: null,
+            error: `未実装の関数: ${functionCall.name}`
+          };
         }
       };
 
@@ -271,6 +495,29 @@ const WebRTCClient = () => {
                   ? error.message
                   : "Failed to send message";
               addDebugLog(`Error sending message: ${errorMsg}`);
+              setError(errorMsg);
+            }
+          }
+          break;
+          
+        case "FUNCTION_CALL":
+          if (data?.functionCall) {
+            addDebugLog(`Received function call from worker: ${JSON.stringify(data.functionCall)}`);
+            // この部分は現在の実装では使用していません（直接データチャネルでFunctionCallを処理しているため）
+          }
+          break;
+        
+        case "SEND_TO_DATA_CHANNEL":
+          if (data?.message && dataChannel.current?.readyState === "open") {
+            try {
+              addDebugLog(`Sending to data channel: ${JSON.stringify(data.message)}`);
+              dataChannel.current.send(JSON.stringify(data.message));
+            } catch (error) {
+              const errorMsg =
+                error instanceof Error
+                  ? error.message
+                  : "Failed to send message to data channel";
+              addDebugLog(`Error: ${errorMsg}`);
               setError(errorMsg);
             }
           }
@@ -439,6 +686,14 @@ const WebRTCClient = () => {
               Send
             </button>
           </div>
+        </div>
+
+        {/* Function Calling Status */}
+        <div className="mt-4 flex-none">
+          <FunctionStatus 
+            activeFunctions={activeFunctions}
+            completedFunctions={completedFunctions}
+          />
         </div>
 
         {/* Debug Log */}

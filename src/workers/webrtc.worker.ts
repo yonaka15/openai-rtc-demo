@@ -94,6 +94,41 @@ const formatResponseRequest = () => {
   };
 };
 
+// Function callingをセットアップするためのセッション更新メッセージ
+const createSessionUpdateWithFunctions = () => {
+  return {
+    type: "session.update",
+    session: {
+      tools: [
+        {
+          type: "function",
+          functions: [
+            {
+              name: "get_weather",
+              description: "指定した場所の現在の天気情報を取得します。",
+              parameters: {
+                type: "object",
+                properties: {
+                  location: {
+                    type: "string",
+                    description: "都市名や住所など、天気を知りたい場所",
+                  },
+                  units: {
+                    type: "string",
+                    description: "温度の単位",
+                    enum: ["celsius", "fahrenheit"],
+                  },
+                },
+                required: ["location"],
+              },
+            }
+          ]
+        }
+      ]
+    }
+  };
+};
+
 // Handle messages from main thread
 self.onmessage = async (event: MessageEvent<MainToWorkerMessage>) => {
   const { type, data } = event.data;
@@ -131,6 +166,33 @@ self.onmessage = async (event: MessageEvent<MainToWorkerMessage>) => {
               userMessage,
               responseRequest,
             },
+          });
+        }
+        break;
+
+      // 関数実行結果をOpenAIに送信
+      case "FUNCTION_RESULT":
+        if (data?.functionResult) {
+          log(`Processing function result: ${JSON.stringify(data.functionResult)}`);
+          
+          // 関数レスポンスイベントを作成
+          const functionResponseEvent = {
+            type: "response.function.response",
+            function: {
+              name: data.functionResult.name,
+              response: data.functionResult.error 
+                ? { error: data.functionResult.error } 
+                : data.functionResult.result
+            },
+            id: data.functionResult.id  // 元のリクエストIDを含める
+          };
+          
+          log(`Sending function response: ${JSON.stringify(functionResponseEvent)}`);
+          
+          // メインスレッドに関数レスポンスイベントを送信
+          self.postMessage({
+            type: "SEND_TO_DATA_CHANNEL",
+            data: { message: functionResponseEvent },
           });
         }
         break;
