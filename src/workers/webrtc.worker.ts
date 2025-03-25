@@ -85,13 +85,152 @@ const formatUserMessage = (message: string) => {
   };
 };
 
-const formatResponseRequest = () => {
-  return {
+/**
+ * ツール（関数）のパラメータに関する型定義
+ */
+type ToolParameter = {
+  /** パラメータの型 */
+  type: string;
+  /** パラメータのプロパティ */
+  properties?: Record<
+    string,
+    {
+      type: string;
+      description?: string;
+      enum?: string[];
+      [key: string]: any;
+    }
+  >;
+  /** 必須パラメータのリスト */
+  required?: string[];
+  /** その他の追加プロパティ */
+  [key: string]: any;
+};
+
+/**
+ * ツール（関数）の定義に関する型定義
+ */
+type Tool = {
+  /** ツールのタイプ - 通常は "function" */
+  type: "function";
+  /** 関数の名前 */
+  name: string;
+  /** 関数の説明 */
+  description: string;
+  /** 関数のパラメータ */
+  parameters: ToolParameter;
+};
+
+/**
+ * レスポンス要求のオプション型定義
+ */
+type ResponseRequestOptions = {
+  /** 応答のモダリティ ["text"], ["audio"], または ["text", "audio"] */
+  modalities?: Array<"text" | "audio">;
+  /** 音声タイプ (audio モダリティを使用する場合) */
+  voice?: "alloy" | "echo" | "fable" | "onyx" | "nova" | "shimmer" | "verse";
+  /** この特定のレスポンスに対する追加指示 */
+  instructions?: string;
+  /** 応答のランダム性 (0.0〜2.0) */
+  temperature?: number;
+  /** 応答の最大トークン数 */
+  maxOutputTokens?: number;
+  /** レスポンス追跡用の一意のID */
+  eventId?: string;
+  /** 使用可能なツール（関数）のリスト */
+  tools?: Tool[];
+  /** ツール選択方法 - "auto", "none", または特定の関数名 */
+  toolChoice?:
+    | "auto"
+    | "none"
+    | { type: "function"; function: { name: string } };
+};
+
+/**
+ * レスポンス要求のフォーマット結果の型定義
+ */
+type ResponseRequestResult = {
+  type: "response.create";
+  event_id?: string;
+  response: {
+    modalities: Array<"text" | "audio">;
+    voice?: string;
+    output_audio_format?: string;
+    instructions?: string;
+    temperature?: number;
+    max_output_tokens?: number;
+    tools?: Tool[];
+    tool_choice?:
+      | "auto"
+      | "none"
+      | { type: "function"; function: { name: string } };
+  };
+};
+
+/**
+ * レスポンス要求の拡張フォーマット関数
+ * @param options - レスポンス設定オプション
+ * @returns フォーマットされたレスポンスリクエストオブジェクト
+ */
+const formatResponseRequest = (
+  options: ResponseRequestOptions = {}
+): ResponseRequestResult => {
+  const {
+    modalities = ["text"],
+    voice = "verse",
+    instructions,
+    temperature,
+    maxOutputTokens,
+    eventId,
+    tools,
+    toolChoice,
+  } = options;
+
+  // 基本的なレスポンスオブジェクトを作成
+  const response: ResponseRequestResult = {
     type: "response.create",
     response: {
-      modalities: ["text"],
+      modalities: modalities,
     },
   };
+
+  // オプションのイベントIDが提供されている場合は追加
+  if (eventId) {
+    response.event_id = eventId;
+  }
+
+  // オーディオモダリティが含まれている場合は音声設定を追加
+  if (modalities.includes("audio")) {
+    response.response.voice = voice;
+    response.response.output_audio_format = "pcm16"; // デフォルトのオーディオフォーマット
+  }
+
+  // 追加指示が提供されている場合は追加
+  if (instructions) {
+    response.response.instructions = instructions;
+  }
+
+  // 温度設定が提供されている場合は追加
+  if (temperature !== undefined) {
+    response.response.temperature = temperature;
+  }
+
+  // 最大出力トークン設定が提供されている場合は追加
+  if (maxOutputTokens !== undefined) {
+    response.response.max_output_tokens = maxOutputTokens;
+  }
+
+  // ツール（関数）が提供されている場合は追加
+  if (tools && tools.length > 0) {
+    response.response.tools = tools;
+  }
+
+  // ツール選択方法が提供されている場合は追加
+  if (toolChoice !== undefined) {
+    response.response.tool_choice = toolChoice;
+  }
+
+  return response;
 };
 
 // Handle messages from main thread
